@@ -1,0 +1,567 @@
+import googlesearch
+print(googlesearch.__file__)
+!pip uninstall -y google googlesearch-python
+!pip install googlesearch-python
+!pip install -U ddgs
+
+
+# !pip install -U ddgs requests beautifulsoup4 pandas
+import csv, difflib, math, os, re, time
+from collections import Counter
+from types import SimpleNamespace
+from urllib.parse import urljoin, unquote, urlparse
+
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+
+HEAD = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+
+# TLD must be letters, so version strings like leaflet@1.9.4 are rejected
+EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}")
+JUNK = ("sentry", "wixpress", "example.", "noreply", "no-reply", "leaflet")
+EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js")
+SKIP = ("facebook", "twitter", "instagram", "linkedin", "youtube", "wikipedia", "yelp", "greatschools")
+GENERIC = {"info", "contact", "supportoffice", "office", "admin", "webmaster", "principal",
+           "feedback", "websupport", "kprinfo"}
+
+# words that can never be part of a person's name
+BAD = {"pay", "student", "students", "school", "parent", "parents", "board", "office",
+       "vice", "assistant", "deputy", "principal", "for", "the", "of", "and", "in", "to", "at",
+       "contact", "staff", "about", "our", "welcome", "message", "messages", "from", "login",
+       "news", "calendar", "home", "information", "email", "phone", "fax", "address",
+       "heading", "here", "another", "executive", "primary", "alternate", "mission",
+       "statement", "ventilation", "report", "non", "teaching", "careers", "trustee",
+       "superintendent", "director", "secretary", "career", "employment", "jobs",
+       "teacher", "librarian", "custodian", "clerk", "counsellor", "counselor",
+       "administrator", "administration", "administrative", "update", "updates",
+       "intermediate", "learning", "programs", "program", "our", "meet", "team",
+       "house", "system", "council", "committee", "club", "clubs", "department", "services",
+       "service", "library", "hall", "room", "county", "ontario", "canada", "quinte", "trenton",
+       "belleville", "hastings", "prince", "edward", "limestone", "kawartha", "ridge",
+       "peterborough", "toronto", "dsb", "dsbn", "district", "township", "village", "town"}
+SCHOOL_WORDS = {"public", "school", "elementary", "secondary", "high", "district", "community",
+                "collegiate", "institute", "vocational", "middle", "junior", "senior", "central",
+                "catholic", "and", "the", "of", "intermediate", "academy", "centre", "center"}
+TYPE_WORDS = {"intermediate", "collegiate", "vocational", "secondary", "elementary", "high",
+              "middle", "junior"}
+PROV_ABBR = {"ontario": "ON", "alberta": "AB", "british columbia": "BC", "quebec": "QC",
+             "manitoba": "MB", "saskatchewan": "SK", "nova scotia": "NS", "new brunswick": "NB",
+             "newfoundland and labrador": "NL", "prince edward island": "PE"}
+
+TITLE = re.compile(r"^(?:(?:Mr|Mrs|Ms|Mx|Dr|Mme)\.?|M\.)\s+")
+NAME_RE = re.compile(r"(?<![A-Za-z])(?:(?:Mr|Mrs|Ms|Mx|Dr|Mme)\.?\s+|M\.\s+)?"
+                     r"(?:[A-Z]\.\s?)?[A-Z][a-zA-Z'’\-]+(?:\s+[A-Z][a-zA-Z'’\-]+){0,2}")
+PRINCIPAL = re.compile(r"\bprincipal\b", re.I)
+ROLE_RE = re.compile(r"principal|secretary|teacher|trustee|superintendent|librarian|custodian|clerk|"
+                     r"counsel|administrator|coordinator|educational assistant|early childhood|"
+                     r"caretaker|head of|chair|manager|lead\b", re.I)
+NOT_PRINCIPAL = re.compile(r"(?:vice|assistant|deputy|co)[\s\-–]*principal", re.I)
+ADMIN_HEAD = re.compile(r"^(?:school\s+)?(?:administration|administrative\s+(?:staff|team)|"
+                        r"admin(?:istration)?\s+team|leadership(?:\s+team)?|school\s+leaders?)\s*:?$", re.I)
+LINK_KW = ["staff", "directory", "administration", "principal", "leadership",
+           "contact", "about", "our-school", "our school"]
+
+
+# ---------- small helpers ----------
+def norm(s):
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def school_words(school):
+    """lowercase words of the school's own name; none of these can be a person's name"""
+    return {w.lower() for w in re.findall(r"[A-Za-z0-9']+", school)}
+
+
+def key_words(school):
+    ws = [norm(w) for w in re.findall(r"[A-Za-z0-9']+", school) if w.lower() not in SCHOOL_WORDS]
+    return [w for w in ws if w]
+
+
+from concurrent.futures import ThreadPoolExecutor
+_EX = ThreadPoolExecutor(max_workers=1)    # one thread owns the browser (also avoids the Jupyter asyncio error)
+_PW = {}
+
+
+def _render(url):
+    from playwright.sync_api import sync_playwright   # pip install playwright ; playwright install chromium
+    if "browser" not in _PW:
+        _PW["pw"] = sync_playwright().start()
+        _PW["browser"] = _PW["pw"].chromium.launch(headless=True)
+    page = _PW["browser"].new_page(user_agent=HEAD["User-Agent"])
+    try:
+        page.goto(url, wait_until="load", timeout=45000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=12000)
+        except Exception:
+            pass
+        page.wait_for_timeout(1500)
+        return page.content()
+    finally:
+        page.close()
+
+
+def get_rendered(url):
+    try:
+        return BeautifulSoup(_EX.submit(_render, url).result(timeout=120), "html.parser")
+    except Exception as ex:
+        print("   render failed:", url[:70], type(ex).__name__, str(ex)[:80])
+        return None
+
+
+def get(url):
+    soup = None
+    try:
+        r = requests.get(url, timeout=(10, 30), headers=HEAD)
+        if r.status_code >= 400:
+            print("   HTTP", r.status_code, url[:70])
+        elif "html" in r.headers.get("content-type", "html"):
+            soup = BeautifulSoup(r.text, "html.parser")
+    except Exception as ex:
+        print("   fetch failed:", url[:70], type(ex).__name__)
+    # the page came back but has no staff info in the raw HTML -> it is probably built by JavaScript
+    if USE_BROWSER and (soup is None or not PRINCIPAL.search(soup.get_text(" ")) ):
+        soup = get_rendered(url) or soup
+    return soup
+
+
+def cf_decode(h):
+    try:
+        k = int(h[:2], 16)
+        return "".join(chr(int(h[i:i + 2], 16) ^ k) for i in range(2, len(h), 2))
+    except Exception:
+        return ""
+
+
+def extract_emails(node):
+    """every email inside a bs4 node: text, raw html, mailto links, cloudflare-obfuscated"""
+    found = EMAIL.findall(node.get_text(" ", strip=True)) + EMAIL.findall(unquote(str(node)))
+    for a in node.find_all("a", href=True):
+        h = a["href"].strip()
+        if h.lower().startswith("mailto:"):
+            found += [x.strip() for x in unquote(h[7:]).split("?")[0].split(",") if "@" in x]
+        elif "email-protection#" in h:
+            found.append(cf_decode(h.split("#")[-1]))
+    found += [cf_decode(t["data-cfemail"]) for t in node.select("[data-cfemail]")]
+    out = []
+    for e in found:
+        e = e.strip(" .,;:<>()[]\"'").lower()
+        if EMAIL.fullmatch(e) and not any(j in e for j in JUNK) and not e.endswith(EXT):
+            out.append(e)
+    return list(dict.fromkeys(out))
+
+
+# ---------- names ----------
+def clean_name(n, sw):
+    n = TITLE.sub("", n.strip())
+    words = n.split()
+    block = BAD | SCHOOL_WORDS | sw
+    while words and words[0].lower().strip(".") in block:
+        words.pop(0)
+    while words and words[-1].lower().strip(".") in block:
+        words.pop()
+    return " ".join(words)
+
+
+def valid_person(name, sw):
+    words = name.split()
+    if not (2 <= len(words) <= 4):
+        return False
+    block = BAD | SCHOOL_WORDS | sw
+    for w in words:
+        if w.lower().strip(".") in block:
+            return False
+        if any(part.lower() in block for part in re.split(r"[-–']", w) if part):   # "Vice-Principal"
+            return False
+        if len(w) >= 3 and w.isupper():                                              # "NHHS"
+            return False
+        if not re.fullmatch(r"[A-Z]\.?|[A-Z][a-zA-Z'’\-]+", w):
+            return False
+    return any(len(w.strip(".")) > 1 for w in words)
+
+
+def pick_name(frag, sw, first=True):
+    """first (or last) valid person name inside a short text fragment"""
+    m = re.match(r"([A-Z][a-zA-Z'’\-]+),\s+([A-Z][a-zA-Z'’\-]+)\b", frag)   # "Lees, Nicole"
+    if m and m.group(2).lower() not in BAD:
+        cand = f"{m.group(2)} {m.group(1)}"
+        if valid_person(cand, sw):
+            return cand
+    names = [clean_name(x.group(0), sw) for x in NAME_RE.finditer(frag)]
+    names = [x for x in names if valid_person(x, sw)]
+    if not names:
+        return ""
+    return names[0] if first else names[-1]
+
+
+def name_from_email(e, sw):
+    parts = [p for p in re.split(r"[._\-]", e.split("@")[0]) if p]
+    if 2 <= len(parts) <= 3 and all(p.isalpha() and len(p) >= 2 for p in parts):
+        nm = " ".join(p.capitalize() for p in parts)
+        if valid_person(nm, sw):
+            return nm
+    return ""
+
+
+def name_candidates(lines, sw):
+    """(name, tier, how). tier 3 = same line as 'Principal', 2 = adjacent line, 1 = admin list"""
+    cands = []
+    for i, line in enumerate(lines):
+        for m in PRINCIPAL.finditer(line):
+            if NOT_PRINCIPAL.search(line[max(0, m.start() - 16):m.end()]):
+                continue
+            if re.match(r"['’]s\b|\s+(?:message|update)", line[m.end():m.end() + 12], re.I):
+                continue
+            after = re.sub(r"^[\s:\-–|,.]+", "", line[m.end():m.end() + 90])
+            before = line[max(0, m.start() - 90):m.start()]
+            nm = pick_name(after, sw, True) or pick_name(before, sw, False)
+            if nm:
+                cands.append((nm, 3, "same-line"))
+                continue
+            if len(line) <= 45:                       # label on its own line: name is next to it
+                def is_role(k):                       # short line that is just a role label
+                    return 0 <= k < len(lines) and len(lines[k]) <= 45 and bool(ROLE_RE.search(lines[k]))
+
+                def name_line(k):                     # neighbour line that is a bare name (no role words)
+                    if not 0 <= k < len(lines) or ROLE_RE.search(lines[k]):
+                        return ""
+                    return pick_name(lines[k], sw)
+
+                # "Name / Role" cards: the name under our label belongs to the NEXT role label
+                nxt = "" if is_role(i + 2) else name_line(i + 1)
+                # "Role / Name" cards: the name above our label belongs to the PREVIOUS role label
+                prv = "" if (line.rstrip().endswith(":") or is_role(i - 2)) else name_line(i - 1)
+                if nxt:
+                    cands.append((nxt, 2, "next-line"))
+                if prv:
+                    cands.append((prv, 1.9, "prev-line"))
+    for i, line in enumerate(lines):                  # "Administration" list: first person = principal
+        if ADMIN_HEAD.match(line):
+            for ln in lines[i + 1:i + 9]:
+                if NOT_PRINCIPAL.search(ln) or re.search(r"\b(vice|assistant|deputy)\b", ln, re.I):
+                    continue
+                nm = pick_name(ln, sw)
+                if nm:
+                    cands.append((nm, 1, "admin-list"))
+                    break
+    return cands
+
+
+# ---------- email <-> name ----------
+def name_email_score(email, name):
+    parts = [norm(p) for p in TITLE.sub("", name).split()]
+    parts = [p for p in parts if p]
+    local = norm(email.split("@")[0])
+    if not parts or not local or local in GENERIC:
+        return 0
+    first, last = parts[0], parts[-1]
+    if local in {first + last, last + first, "".join(parts)}:
+        return 3
+    if len(last) >= 3 and local in {first[0] + last, first + last[0], last + first[0], last[0] + first}:
+        return 2
+    if len(last) >= 4 and last in local:
+        return 1
+    return 0
+
+
+def best_email(name, pool):
+    best, sc = "", 0
+    for e in dict.fromkeys(pool):
+        s = name_email_score(e, name)
+        if s > sc:
+            best, sc = e, s
+    return best, sc
+
+
+def choose_name(cands, pool):
+    if not cands:
+        return "", ""
+    by = {}
+    for nm, tier, how in cands:
+        d = by.setdefault(nm, {"tier": 0, "n": 0, "how": how})
+        d["n"] += 1
+        if tier > d["tier"]:
+            d["tier"], d["how"] = tier, how
+
+    def score(nm):
+        d = by[nm]
+        return d["tier"] + 0.2 * min(d["n"], 5) + (2 if best_email(nm, pool)[1] >= 2 else 0)
+
+    best = max(by, key=score)
+    return best, by[best]["how"]
+
+
+def is_subseq(small, big):
+    it = iter(big)
+    return all(ch in it for ch in small)
+
+
+def pick_school_email(emails, school, src, exclude=()):
+    s = norm(school)
+    words = re.findall(r"[A-Za-z0-9]+", school)
+    inits = {"".join(w[0] for w in words).lower(),
+             "".join(w[0] for w in words if w.lower() not in {"public", "school", "the", "of", "and"}).lower()}
+    emails = [e for e in dict.fromkeys(emails) if e not in exclude]
+
+    def score(e):
+        local = norm(e.split("@")[0])
+        if len(local) < 3 or local in GENERIC:
+            return 0
+        sc = difflib.SequenceMatcher(None, local, s).ratio() + (1 if local in s else 0)
+        if local in inits:                                   # ess@ = Eastside Secondary School
+            sc = max(sc, 1.5)
+        if len(local) >= 5 and local[0] == s[0] and is_subseq(local, s):   # madoctwp@, massredner@
+            sc = max(sc, 1.2)
+        return sc
+
+    ranked = sorted(emails, key=score, reverse=True)
+    if ranked and score(ranked[0]) >= 0.5:
+        return ranked[0], ranked[1:]
+    return "", ranked          # nothing matches the school name: leave blank rather than return a staff member
+
+
+# ---------- page parsing ----------
+def role_emails(soup):
+    """emails sitting in the same small block as the word 'Principal' (not vice/assistant)"""
+    out = []
+    for s in soup.find_all(string=PRINCIPAL):
+        if NOT_PRINCIPAL.search(s) or re.search(r"principal['’]s", s, re.I):
+            continue
+        node = s.parent
+        for _ in range(3):
+            if node is None:
+                break
+            text = node.get_text(" ", strip=True)
+            if len(text) > 300:
+                break
+            ems = [e for e in extract_emails(node) if norm(e.split("@")[0]) not in GENERIC]
+            if ems:
+                if len(ems) == 1 and not NOT_PRINCIPAL.search(text):
+                    out.append(ems[0])
+                break
+            node = node.parent
+    return out
+
+
+def parse_page(soup, sw):
+    emails = extract_emails(soup)                     # before scripts are stripped (json-ld etc.)
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
+    rem = role_emails(soup)
+    lines = [l.strip() for l in soup.get_text("\n", strip=True).split("\n") if l.strip()]
+    return emails, name_candidates(lines, sw), rem
+
+
+# ---------- search / crawl ----------
+def gsearch(q, tries=4):
+    from ddgs import DDGS
+    for i in range(tries):
+        try:
+            return [SimpleNamespace(url=r["href"], body=r.get("body", ""))
+                    for r in DDGS(timeout=25).text(q, max_results=6)]
+        except Exception as ex:
+            print("   search retry:", type(ex).__name__)
+            time.sleep(4 * (i + 1))
+    return []
+
+
+def school_match(text, school):
+    t = norm(text)
+    kw = key_words(school)
+    if not kw:
+        return norm(school) in t
+    need = [w for w in kw if len(w) >= 3] or kw
+    present = [w for w in need if w in t]
+    if len(present) < max(1, math.ceil(0.6 * len(need))):
+        return False
+    types = {w.lower() for w in re.findall(r"[A-Za-z]+", school)} & TYPE_WORDS
+    return not types or any(w in t for w in types)
+
+
+def relevant(text, school, prov, board=""):
+    if not school_match(text, school):
+        return False
+    if board and norm(board.split()[0]) not in norm(text):
+        return False
+    abbr = PROV_ABBR.get(prov.lower(), "")
+    return bool(re.search(re.escape(prov), text, re.I) or (abbr and re.search(r",\s*" + abbr + r"\b", text)))
+
+
+def crawl_links(soup, base, limit=5):
+    host = urlparse(base).netloc
+    ranked = []
+    for a in soup.find_all("a", href=True):
+        s = (a["href"] + " " + a.get_text(" ", strip=True)).lower()
+        if re.search(r"login|career|employment|jobs|calendar|portal|mailto:|tel:|javascript:|\.pdf", s):
+            continue
+        p = next((i for i, kw in enumerate(LINK_KW) if kw in s), None)
+        if p is None:
+            continue
+        u = urljoin(base, a["href"]).split("#")[0]
+        if urlparse(u).netloc == host and u != base:
+            ranked.append((p, u))
+    out = []
+    for _, u in sorted(ranked):
+        if u not in out:
+            out.append(u)
+    return out[:limit]
+
+
+def find(school, prov, board=""):
+    board = board or DEFAULT_BOARD
+    sw = school_words(school)
+    emails, cands, rem = [], [], []
+    src = site = ""
+    site_part = f" site:{DOMAIN}" if DOMAIN else ""
+    queries = [f"{school} {prov} principal{site_part}",
+               f"{school} staff directory{site_part}",
+               f"{school} {board} {prov} school contact"]
+    results = []
+    for q in queries:
+        q = re.sub(r"\s+", " ", q)
+        results = gsearch(q)
+        print(f"   '{q}' -> {len(results)} results")
+        for r in results:
+            if any(s in r.url for s in SKIP):
+                continue
+            host = urlparse(r.url).netloc.replace("www.", "")
+            if site and host != site:                 # once a site worked, stay on it
+                continue
+            soup = get(r.url)
+            if not soup:
+                continue
+            pages = [(r.url, soup)]
+            for u in crawl_links(soup, r.url):
+                s = get(u)
+                if s:
+                    pages.append((u, s))
+            if not relevant(" ".join(p[1].get_text(" ", strip=True) for p in pages), school, prov, board):
+                continue                              # wrong school / province / careers page
+            for u, s in pages:
+                e, c, re_ = parse_page(s, sw)
+                emails += e
+                cands += c
+                rem += re_
+                if (e or c) and not src:
+                    src, site = u, host
+            if cands and emails:
+                break
+            time.sleep(1.5)
+        if cands and emails:
+            break
+
+    for e in rem:                                     # "Principal ... lynn_kostuch@x.ca" -> Lynn Kostuch
+        nm = name_from_email(e, sw)
+        if nm:
+            cands.append((nm, 3, "role-email"))
+
+    if not cands:                                     # last resort: search snippets
+        for r in gsearch(f"{school} {board} {prov} principal"):
+            if school_match(r.body, school):
+                cands += name_candidates([l for l in r.body.split("\n") if l.strip()], sw)
+                if cands:
+                    src = src or r.url
+                    break
+
+    pool = rem + emails
+    principal, how = choose_name(cands, pool)
+    p_email, sc = best_email(principal, pool) if principal else ("", 0)
+    if sc == 1:                                       # last-name-only match: accept only if unambiguous
+        hits = [e for e in dict.fromkeys(pool) if name_email_score(e, principal) >= 1]
+        if len(hits) != 1:
+            p_email = ""
+    if not p_email and sc < 2 and rem and how == "role-email":
+        p_email = rem[0]
+    s_email, others = pick_school_email(emails, school, src, exclude={p_email})
+
+    used, kind = (p_email, "principal") if p_email else ((s_email, "school") if s_email else ("", "none"))
+    return dict(principal=principal, how=how, principal_email=p_email, email_used=used,
+                email_type=kind, school_email=s_email, other_emails="; ".join(others[:3]), source=src)
+
+
+DEFAULT_BOARD = "Hastings Prince Edward"   # page must mention this -> stops Toronto/Limestone/KPR matches
+DOMAIN = "hpedsb.on.ca"                    # restrict searches to this site ("" = whole web)
+USE_BROWSER = False                        # True = render JavaScript pages with Playwright (see get_rendered)
+
+# ---- type your schools here: (school name, province)  or  (school, province, "board hint") ----
+schools = [
+    ("Athol-South Marysburgh School Public School", "Ontario"),
+    ("Bayside Public School", "Ontario"),
+    ("Bayside Secondary School", "Ontario"),
+    ("Bayside Secondary School - Elementary", "Ontario"),
+    ("Bird's Creek Public School", "Ontario"),
+    ("C M L Snider Elementary School", "Ontario"),
+    ("Centennial Secondary School", "Ontario"),
+    ("Centennial Secondary School Elementary School", "Ontario"),
+    ("Central Hastings School", "Ontario"),
+    ("Central Hastings School Secondary School", "Ontario"),
+    ("Centre Hastings ECPP", "Ontario"),
+    ("Coe Hill Public School", "Ontario"),
+    ("Deseronto Public School", "Ontario"),
+    ("Easthill Elementary School", "Ontario"),
+    ("Eastside Secondary School", "Ontario"),
+    ("Foxboro Public School", "Ontario"),
+    ("Frankford Public School", "Ontario"),
+    ("Harmony ECPP", "Ontario"),
+    ("Harmony Public School", "Ontario"),
+    ("Harry J Clarke Public School", "Ontario"),
+    ("Hastings & Prince Edward DSB Summer School", "Ontario"),
+    ("Hermon Public School", "Ontario"),
+    ("Kente Public School", "Ontario"),
+    ("Madoc Township Public School", "Ontario"),
+    ("Marmora Public School", "Ontario")
+]
+
+COLS = ["school", "province", "principal", "how", "principal_email", "email_used",
+        "email_type", "school_email", "other_emails", "source"]
+
+def debug(school, prov="Ontario", board=DEFAULT_BOARD):
+    """Shows what each step sees for ONE school: search -> fetch -> match -> parse."""
+    q = f"{school} {prov} principal site:{DOMAIN}"
+    res = gsearch(q)
+    print("SEARCH:", q, "->", len(res), "results")
+    for r in res:
+        print("\nURL:", r.url)
+        soup = get(r.url)
+        if not soup:
+            print("  FETCH FAILED")
+            continue
+        txt = soup.get_text(" ", strip=True)
+        print("  chars:", len(txt), "| 'principal' in raw page:", bool(PRINCIPAL.search(txt)))
+        print("  emails in raw page:", extract_emails(soup)[:6])
+        print("  school_match:", school_match(txt, school), "| board word present:", norm(board.split()[0]) in norm(txt))
+        print("  links it would crawl:", crawl_links(soup, r.url))
+        for m in list(PRINCIPAL.finditer(txt))[:3]:
+            print("  ...", txt[max(0, m.start() - 80):m.end() + 120])
+        e, c, rem = parse_page(soup, school_words(school))
+        print("  name candidates:", c[:4], "| role emails:", rem[:3])
+
+
+if __name__ == "__main__":
+    OUT = "results.csv"
+    todo = list(dict.fromkeys(tuple(s) for s in schools))          # drops duplicate rows
+    with open(OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(COLS)
+        for item in todo:
+            school, prov = item[0], item[1]
+            board = item[2] if len(item) > 2 else ""
+            print(school)
+            try:
+                r = find(school, prov, board)
+            except Exception as ex:                                # one bad school never kills the run
+                print("   ERROR:", type(ex).__name__, ex)
+                r = dict(principal="", how="error", principal_email="", email_used="", email_type="none",
+                         school_email="", other_emails="", source="")
+            print("   ->", r["principal"] or "?", "|", r["email_used"] or "?", f"({r['email_type']}, {r['how'] or '-'})")
+            w.writerow([school, prov] + [r[c] for c in COLS[2:]])
+            f.flush()                                              # saved after every school
+            time.sleep(3)
+
+
+# ---- show the table (must be the last, unindented line of the cell) ----
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_colwidth", None)
+df = pd.read_csv("results.csv") if os.path.exists("results.csv") else pd.DataFrame(columns=COLS)
+df
